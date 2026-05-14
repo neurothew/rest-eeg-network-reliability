@@ -7,5 +7,5 @@ Ma, M. K.-H., Fong, M. C.-M., & Wang, W. S. (2025). A Reliability Study in Resti
 
 Ma, M. K.-H. & Fong, M. C.-M. (accepted). A Path Toward Reproducibility: A Dual Perspective on Resting-State EEG Network Characteristics.
 
-Stay tuned!!
+Scripts will be uploaded soon, stay tuned!!
 
