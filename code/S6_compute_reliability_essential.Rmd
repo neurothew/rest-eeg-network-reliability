@@ -1,0 +1,521 @@
+---
+title: "analysis"
+author: "Matthew King-Hang Ma"
+date: "2025-08-21"
+output: html_document
+---
+
+# Import libraries and define useful functions
+
+## Import libraries
+```{r}
+# For general purpose and plotting
+library(Cairo)
+library(tidyverse)
+library(arrow)
+library(ggpubr)
+library(ggsci)
+library(patchwork)
+library(roxygen2)
+library(progressr)
+handlers(handler_progress(
+  format = ":message [:bar] :percent | elapsed: :elapsed | eta: :eta"
+))
+
+# For statistical analysis
+library(rstatix)
+library(emmeans)
+library(ez)
+library(xtable)
+library(lme4)
+library(lmerTest)
+library(ggstatsplot)
+library(MuMIn)
+library(glue)
+library(here)
+```
+
+
+## Defining relevant functions for ICC computation
+These functions are designed to compute the ICC(2,1) from the computed network measurements. 
+```{r}
+
+run_foolproof_lmer <- function(formula_str, this_data) {
+  # 1. Initialize tracking variables
+  captured_logs <- character()
+  is_converged = TRUE
+  convergence_warning <- FALSE
+  is_singular <- FALSE
+  
+  # 2. Run the model inside handlers to catch "transient" R warnings/messages
+  this_lme <- withCallingHandlers(
+    lmer(as.formula(formula_str), data = this_data),
+    warning = function(w) {
+      captured_logs <<- c(captured_logs, w$message)
+      invokeRestart("muffleWarning") # Hides it from the console
+    },
+    message = function(m) {
+      # Some lme4 steps use messages instead of warnings
+      captured_logs <<- c(captured_logs, m$message)
+      invokeRestart("muffleMessage") 
+    }
+  )
+  
+  # 3. TARGET A: Check for Singularity
+  if (isSingular(this_lme)) {
+    is_singular <- TRUE
+    captured_logs <- c(captured_logs, "boundary (singular) fit")
+  }
+  
+  # 4. TARGET B: Check Internal lme4 Messages (Convergence)
+  internal_msgs <- this_lme@optinfo$conv$lme4$messages
+  
+  if (!is.null(internal_msgs)) {
+    # Add any internal messages (like "Model failed to converge") to our log
+    captured_logs <- c(captured_logs, unlist(internal_msgs))
+    
+    # Flag specifically if it's a convergence issue
+    if (any(grepl("failed to converge", internal_msgs, ignore.case = TRUE))) {
+      is_converged = FALSE
+      convergence_warning <- TRUE
+    }
+  }
+  
+  # 5. Clean up the logs (remove empty strings, line breaks, and duplicates)
+  captured_logs <- captured_logs[captured_logs != ""]
+  captured_logs <- gsub("\n", " ", captured_logs) # Keep logs on a single line
+  captured_logs <- unique(trimws(captured_logs))
+  
+  # 6. Return a clean list with everything you need
+  return(list(
+    model = this_lme,
+    is_singular = is_singular,
+    is_converged = is_converged,
+    # failed_to_converge = convergence_warning,
+    all_warnings = captured_logs
+  ))
+}
+
+
+compute_icc_2way_boot = function(df_all, this_network_var, this_band, this_thres_value, this_effcycles, k, 
+                      nboot = 1000) {
+  this_data = df_all %>% 
+    filter(Band == this_band, ThresValue == this_thres_value, EffCycles == this_effcycles)
+  
+  # Try two-way model first
+  formula_str_2way = paste0(this_network_var, " ~ 1 + (1|SubjectCode) + (1|rand_seed)")
+  
+  # Fit two-way model with catching warnings
+  convergence_warning_2way = FALSE
+  this_lme_2way = withCallingHandlers(
+    lmer(as.formula(formula_str_2way), this_data),
+    warning = function(w) {
+      convergence_warning_2way <<- TRUE
+      warning_message <<- w$message  # Capture the actual warning text
+    }
+  )
+  
+  # Check if two-way model is viable
+  is_singular_2way = isSingular(this_lme_2way)
+  is_converged_2way = !convergence_warning_2way
+  
+  # If two-way model fails, fit one-way model
+  use_oneway = is_singular_2way || !is_converged_2way
+  
+  if(use_oneway) {
+    formula_str = paste0(this_network_var, " ~ 1 + (1|SubjectCode)")
+    convergence_warning = FALSE
+    this_lme = withCallingHandlers(
+      lmer(as.formula(formula_str), this_data),
+      warning = function(w) {
+        convergence_warning <<- TRUE
+      }
+    )
+    is_singular = isSingular(this_lme)
+    is_converged = !convergence_warning
+  } else {
+    this_lme = this_lme_2way
+    is_singular = is_singular_2way
+    is_converged = is_converged_2way
+  }
+  
+  # Extract variance components
+  vc = lme4::VarCorr(this_lme)
+  
+  # Extract variances differently based on model type
+  if(!use_oneway) {
+    # For two-way model
+    v_subject = as.numeric(vc$SubjectCode)
+    v_seed = as.numeric(vc$rand_seed)
+    v_residual = attr(vc, "sc")^2
+    
+    # Compute ICCs for two-way model
+    icc_single = v_subject / (v_subject + v_seed + v_residual)
+    icc_k = v_subject / (v_subject + v_seed/k + v_residual/k)
+  } else {
+    # For one-way model
+    v_subject = as.numeric(vc$SubjectCode)
+    v_seed = 0  # No seed variance in one-way model
+    v_residual = attr(vc, "sc")^2
+    
+    # Compute ICCs for one-way model
+    icc_single = v_subject / (v_subject + v_residual)
+    icc_k = v_subject / (v_subject + v_residual/k)
+  }
+  
+  # Bootstrap function
+  get_icc <- function(model) {
+    vc <- VarCorr(model)
+    if(length(vc) > 1) {  # two-way model
+      v_subj <- as.numeric(vc$SubjectCode)
+      v_seed <- as.numeric(vc$rand_seed)
+      v_res <- attr(vc, "sc")^2
+      icc1 <- v_subj / (v_subj + v_seed + v_res)
+      icck <- v_subj / (v_subj + v_seed/k + v_res/k)
+    } else {  # one-way model
+      v_subj <- as.numeric(vc$SubjectCode)
+      v_res <- attr(vc, "sc")^2
+      icc1 <- v_subj / (v_subj + v_res)
+      icck <- v_subj / (v_subj + v_res/k)
+    }
+    c(ICC_2_1 = icc1, ICC_2_k = icck)
+  }
+  
+  # Perform bootstrap if model converged
+  if(is_converged) {
+    boot_results <- bootMer(this_lme, 
+                           FUN = get_icc, 
+                           nsim = nboot, 
+                           .progress = "txt")
+    
+    ci_icc1 = quantile(boot_results$t[,1], c(0.025, 0.975))
+    ci_icck = quantile(boot_results$t[,2], c(0.025, 0.975))
+  } else {
+    ci_icc1 = c(NA, NA)
+    ci_icck = c(NA, NA)
+  }
+  
+  # Return results
+  df_icc = as_tibble(list(
+    ICC_2_1 = icc_single,
+    ICC_2_k = icc_k,
+    ICC_2_1_CI_lower = ci_icc1[1],
+    ICC_2_1_CI_upper = ci_icc1[2],
+    ICC_2_k_CI_lower = ci_icck[1],
+    ICC_2_k_CI_upper = ci_icck[2],
+    var_subject = v_subject,
+    var_seed = v_seed,
+    var_residual = v_residual,
+    is_singular = is_singular,
+    is_converged = is_converged,
+    used_oneway = use_oneway,
+    warning_triggered = warning_message %||% NA_character_  # Capture warning message if exists
+  ))
+  
+  return(df_icc)
+}
+
+#' Compute ICC with Two-Way Model and Fallback, with Bootstrapped CIs
+#'
+#' This function calculates the Intraclass Correlation Coefficient (ICC) using a two-way
+#' linear mixed-effects model. If the two-way model fails to converge or is singular,
+#' it gracefully falls back to a simpler one-way model. It also performs a
+#' parametric bootstrap to compute confidence intervals for the ICC values.
+#'
+#' @param df_all A data frame containing all the data.
+#' @param this_network_var A character string of the network variable to be analyzed.
+#' @param this_band A character string of the frequency band.
+#' @param this_thres_value A numeric threshold value.
+#' @param this_effcycles An integer for the number of effective cycles.
+#' @param k An integer representing the number of repeated measures per subject.
+#' @param nboot An integer for the number of bootstrap replicates (default is 1000).
+#' @param ncores An integer for the number of CPU cores to use for parallel bootstrapping (default is 1).
+#'
+#' @return A tibble with one row containing the calculated ICCs, their bootstrapped
+#'         confidence intervals, variance components, and logical flags indicating
+#'         model status.
+#'
+#' @importFrom lme4 lmer VarCorr isSingular bootMer
+#' @importFrom dplyr filter
+#' @importFrom tibble as_tibble
+#' @importFrom stats quantile
+compute_icc_2way_boot_parallel = function(df_all, this_network_var, this_band, this_thres_value, this_effcycles, k, nboot = 500, ncores = 1) {
+  
+  # Filter the data for the specific combination of parameters
+  this_data = df_all %>%
+    filter(Band == this_band, ThresValue == this_thres_value, EffCycles == this_effcycles)
+  #-----------------------------------------------------------------------------
+  # Model Fitting
+  #-----------------------------------------------------------------------------
+  
+  # Try to fit the two-way model first
+  formula_str_2way = paste0(this_network_var, " ~ 1 + (1|SubjectCode) + (1|rand_seed)")
+  
+  list_results_2way = run_foolproof_lmer(formula_str_2way, this_data)
+  this_lme = list_results_2way$model
+  is_singular_2way = list_results_2way$is_singular
+  is_converged_2way = list_results_2way$is_converged
+  
+  # Determine if we need to use the one-way model
+  use_oneway = is_singular_2way || !is_converged_2way
+  
+  if (use_oneway) {
+    message(glue("Two-way model failed for {this_network_var}, Band={this_band}, Thres={this_thres_value}, Effcycle={this_effcycles}. Falling back to one-way model."))
+    formula_str = paste0(this_network_var, " ~ 1 + (1|SubjectCode)")
+    
+    list_results_oneway = run_foolproof_lmer(formula_str, this_data)
+    this_lme = list_results_oneway$model
+    is_singular_oneway = list_results_oneway$is_singular
+    message(is_singular_oneway)
+    is_converged_oneway = list_results_oneway$is_converged
+  } 
+  else {
+    is_singular_oneway = NA
+    is_converged_oneway = NA
+  }
+  
+  #-----------------------------------------------------------------------------
+  # Variance Components and ICC Calculation
+  #-----------------------------------------------------------------------------
+  
+  if (use_oneway){
+    this_lme = list_results_oneway$model
+    is_converged = is_converged_oneway
+  } else {
+    this_lme = list_results_2way$model
+    is_converged = is_converged_2way
+  }
+  
+  vc = lme4::VarCorr(this_lme)
+  v_subject = as.numeric(vc$SubjectCode)
+  v_residual = attr(vc, "sc")^2
+  
+  # Check if rand_seed variance component exists
+  if ("rand_seed" %in% names(vc)) {
+    v_seed = as.numeric(vc$rand_seed)
+  } else {
+    v_seed = 0
+  }
+  
+  # Compute ICCs
+  icc_single = v_subject / (v_subject + v_seed + v_residual)
+  icc_k = v_subject / (v_subject + v_seed/k + v_residual/k)
+  
+  #-----------------------------------------------------------------------------
+  # Bootstrapping
+  #-----------------------------------------------------------------------------
+  
+  # Define the function to be bootstrapped
+  get_icc <- function(model) {
+    vc <- lme4::VarCorr(model)
+    v_subj <- as.numeric(vc$SubjectCode)
+    v_res <- attr(vc, "sc")^2
+    
+    # Check if the rand_seed variance exists
+    if ("rand_seed" %in% names(vc)) {
+      v_seed <- as.numeric(vc$rand_seed)
+    } else {
+      v_seed <- 0
+    }
+    
+    icc1 <- v_subj / (v_subj + v_seed + v_res)
+    icck <- v_subj / (v_subj + v_seed/k + v_res/k)
+    
+    c(ICC_2_1 = icc1, ICC_2_k = icck)
+  }
+  
+  ci_icc1 = c(NA, NA)
+  ci_icck = c(NA, NA)
+  
+  if (is_converged) {
+    boot_results <- tryCatch({
+      bootMer(this_lme,
+              FUN = get_icc,
+              nsim = nboot,
+              seed = 20260513,
+              parallel = "multicore",
+              ncpus = ncores)
+    }, error = function(e) {
+      warning("Bootstrapping failed for this model.", call. = FALSE)
+      NULL
+    })
+    
+    if (!is.null(boot_results)) {
+      ci_icc1 = quantile(boot_results$t[, 1], c(0.025, 0.975))
+      ci_icck = quantile(boot_results$t[, 2], c(0.025, 0.975))
+    }
+  }
+  
+  #-----------------------------------------------------------------------------
+  # Return Results
+  #-----------------------------------------------------------------------------
+  
+  df_icc = as_tibble(list(
+    ICC_2_1 = icc_single,
+    ICC_2_k = icc_k,
+    ICC_2_1_CI_lower = ci_icc1[1],
+    ICC_2_1_CI_upper = ci_icc1[2],
+    ICC_2_k_CI_lower = ci_icck[1],
+    ICC_2_k_CI_upper = ci_icck[2],
+    var_subject = v_subject,
+    var_seed = v_seed,
+    var_residual = v_residual,
+    is_singular_twoway = is_singular_2way,
+    is_singular_oneway = is_singular_oneway %||% NA,  # NA if one-way model was not used
+    is_converged_twoway = is_converged_2way,
+    is_converged_oneway = is_converged_oneway %||% NA,  # NA if one-way model was not used
+    used_oneway = use_oneway
+  ))
+  return(df_icc)
+}
+
+# # A wrapper function of `compute_icc_2way_boot_parallel` to run through all combinations
+compute_icc_results_boot = function(df_input, list_network_var, list_band, list_thres_value, list_cycles, k, ncores){
+  with_progress({
+    p <- progressor(steps = length(list_network_var) * length(list_band) * length(list_thres_value) * length(list_cycles))
+    icc_results = crossing(network_var = list_network_var,
+                           Band = list_band,
+                           ThresValue = list_thres_value,
+                           EffCycles = list_cycles,
+                           k = k,
+                           ncores = ncores) %>%
+      group_by(network_var, Band, ThresValue, EffCycles, k) %>%
+      group_modify(~ {
+        p() # this will increment the progress bar
+        compute_icc_2way_boot_parallel(df_input, .y$network_var, .y$Band, .y$ThresValue, .y$EffCycles, .y$k)
+      })
+  })
+
+  icc_results$Band = factor(icc_results$Band, list_band)
+  icc_results$network_var = factor(icc_results$network_var, list_network_var)
+  return(icc_results)
+}
+
+
+
+```
+
+
+# Data preprocessing
+
+## Data integration: Loading dataframe computed from S5.
+
+To load the dataframes computed from S5.
+```{r}
+list_band = c("delta", "theta", "alpha", "beta", "gamma")
+list_task = c("EyesOpenNoTask", "EyesClosedNoTask")
+
+load_df = function(this_task, this_band){
+  dir_derivative = here("derivative", "study_reliability", "group-connectivity", "ciplv")
+  fname = list.files(dir_derivative, glue("task-{this_task}.*filt-{this_band}.*"))
+  df = arrow::read_feather(file.path(dir_derivative, fname))
+  df$EffCycles = as.numeric(df$EffCycles)
+  return(df)
+}
+
+# They are loaded separately to avoid an extremely large dataframe
+df_eo = crossing(BandInit=list_band) %>% group_by(BandInit) %>% group_modify(~load_df("EyesOpenNoTask", .y$BandInit)) %>% ungroup() %>% select(-BandInit)
+
+df_ec = crossing(BandInit=list_band) %>% group_by(BandInit) %>% group_modify(~load_df("EyesClosedNoTask", .y$BandInit)) %>% ungroup() %>% select(-BandInit)
+
+```
+
+## Data cleaning, reduction and integration
+```{r}
+
+# Filter out those rows with SWP < 0, which might due to errors in the SWP computation.
+df_ec = df_ec %>% filter(SWP > 0)
+df_eo = df_eo %>% filter(SWP > 0)
+
+df_all = bind_rows(df_ec, df_eo)
+
+```
+
+
+# Computing reliability map
+
+Use bootstrapping approach with two-way random intercepts model
+
+## Reliability map: CC
+Reliability map for clustering coefficient
+```{r}
+list_thres_value = df_all$ThresValue %>% unique()
+
+# Computing reliability map for theta+ bands
+list_network_var = c("clustering_coef")
+list_band = c("theta", "alpha", "beta", "gamma")
+list_cycles = c(6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 36, 42, 48, 54, 60, 66, 72, 78, 84, 90, 96, 102, 108, 114, 120)
+df_ec_cc_icc_results_boot_fourbands = compute_icc_results_boot(df_ec, list_network_var, list_band, list_thres_value, list_cycles, 30, 14)
+# saveRDS(df_ec_cc_icc_results_boot_fourbands, "df_ec_cc_icc_results_boot_fourbands.rds")
+saveRDS(df_ec_cc_icc_results_boot_fourbands, here("computed_v_EMBC2026Refactor", "df_ec_cc_icc_results_boot_fourbands.rds"))
+
+df_eo_cc_icc_results_boot_fourbands = compute_icc_results_boot(df_eo, list_network_var, list_band, list_thres_value, list_cycles, 30, 14)
+# saveRDS(df_eo_cc_icc_results_boot_fourbands, "df_eo_cc_icc_results_boot_fourbands.rds")
+saveRDS(df_eo_cc_icc_results_boot_fourbands, here("computed_v_EMBC2026Refactor", "df_eo_cc_icc_results_boot_fourbands_v20260513.rds"))
+
+# Computing reliability map for delta bands
+list_network_var = c("clustering_coef")
+list_band = c("delta")
+list_cycles = c(6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30)
+df_ec_cc_icc_results_boot_delta = compute_icc_results_boot(df_ec, list_network_var, list_band, list_thres_value, list_cycles, 30, 14)
+saveRDS(df_ec_cc_icc_results_boot_delta, here("computed_v_EMBC2026Refactor", "df_ec_cc_icc_results_boot_delta.rds"))
+
+df_eo_cc_icc_results_boot_delta = compute_icc_results_boot(df_eo, list_network_var, list_band, list_thres_value, list_cycles, 30, 14)
+saveRDS(df_eo_cc_icc_results_boot_delta, here("computed_v_EMBC2026Refactor", "df_eo_cc_icc_results_boot_delta.rds"))
+```
+
+## Reliability map: GE
+Reliability map for global efficiency
+```{r}
+list_thres_value = df_all$ThresValue %>% unique()
+
+# Computing reliability map for theta+ bands
+list_network_var = c("global_eff")
+list_band = c("theta", "alpha", "beta", "gamma")
+list_cycles = c(6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 36, 42, 48, 54, 60, 66, 72, 78, 84, 90, 96, 102, 108, 114, 120)
+df_ec_ge_icc_results_boot_fourbands = compute_icc_results_boot(df_ec, list_network_var, list_band, list_thres_value, list_cycles, 30, 14)
+saveRDS(df_ec_ge_icc_results_boot_fourbands, here("computed_v_EMBC2026Refactor", "df_ec_ge_icc_results_boot_fourbands.rds"))
+
+df_eo_ge_icc_results_boot_fourbands = compute_icc_results_boot(df_eo, list_network_var, list_band, list_thres_value, list_cycles, 30, 14)
+saveRDS(df_eo_ge_icc_results_boot_fourbands, here("computed_v_EMBC2026Refactor", "df_eo_ge_icc_results_boot_fourbands.rds"))
+
+# Computing reliability map for delta bands
+list_network_var = c("global_eff")
+list_band = c("delta")
+list_cycles = c(6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30)
+df_ec_ge_icc_results_boot_delta = compute_icc_results_boot(df_ec, list_network_var, list_band, list_thres_value, list_cycles, 30, 14)
+saveRDS(df_ec_ge_icc_results_boot_delta, here("computed_v_EMBC2026Refactor", "df_ec_ge_icc_results_boot_delta.rds"))
+
+df_eo_ge_icc_results_boot_delta = compute_icc_results_boot(df_eo, list_network_var, list_band, list_thres_value, list_cycles, 30, 14)
+saveRDS(df_eo_ge_icc_results_boot_delta, here("computed_v_EMBC2026Refactor", "df_eo_ge_icc_results_boot_delta.rds"))
+```
+
+
+## Reliability map: SWP
+Reliability map for small-world propensity
+```{r}
+list_thres_value = df_all$ThresValue %>% unique()
+
+# Computing reliability map for theta+ bands
+list_network_var = c("SWP")
+list_band = c("theta", "alpha", "beta", "gamma")
+list_cycles = c(6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 36, 42, 48, 54, 60, 66, 72, 78, 84, 90, 96, 102, 108, 114, 120)
+df_ec_swp_icc_results_boot_fourbands = compute_icc_results_boot(df_ec, list_network_var, list_band, list_thres_value, list_cycles, 30, 14)
+saveRDS(df_ec_swp_icc_results_boot_fourbands, here("computed_v_EMBC2026Refactor", "df_ec_swp_icc_results_boot_fourbands.rds"))
+
+df_eo_swp_icc_results_boot_fourbands = compute_icc_results_boot(df_eo, list_network_var, list_band, list_thres_value, list_cycles, 30, 14)
+saveRDS(df_eo_swp_icc_results_boot_fourbands, here("computed_v_EMBC2026Refactor", "df_eo_swp_icc_results_boot_fourbands.rds"))
+
+# Computing reliability for delta band
+list_network_var = c("SWP")
+list_band = c("delta")
+list_cycles = c(6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30)
+df_ec_swp_icc_results_boot_delta = compute_icc_results_boot(df_ec, list_network_var, list_band, list_thres_value, list_cycles, 30, 14)
+saveRDS(df_ec_swp_icc_results_boot_delta, here("computed_v_EMBC2026Refactor", "df_ec_swp_icc_results_boot_delta.rds"))
+
+df_eo_swp_icc_results_boot_delta = compute_icc_results_boot(df_eo, list_network_var, list_band, list_thres_value, list_cycles, 30, 14)
+saveRDS(df_eo_swp_icc_results_boot_delta, here("computed_v_EMBC2026Refactor", "df_eo_swp_icc_results_boot_delta.rds"))
+```
+
+
+

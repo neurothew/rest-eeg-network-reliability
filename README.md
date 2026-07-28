@@ -14,9 +14,10 @@ code/
 ├── S2_main_filtering.py                              # Step 2
 ├── S3_main_epoching_and_computing_conn_mat.py        # Step 3
 ├── S4_computing_network_measures.py                  # Step 4
-└── S5_combining_conn_dataframe.py                    # Step 5
+├── S5_combining_conn_dataframe.py                    # Step 5
+└── S6_compute_reliability_essential.Rmd              # Step 6
 ```
 
-Step 1 to 5 detail the procedures from preprocessing to obtaining a dataframe storing the all the network characteristics computed.
+Step 1 to 5 detail the procedures from preprocessing to obtaining a dataframe storing the all the network characteristics computed. After step 5, the dataframe will be loaded into step 6, which is a R markdown file for computing reliability.
 
-After step 5, the dataframe will be loaded in to R for computing reliability, we are preparing S6 and will upload soon.
+Note that we made the present scripts available for transparency and readers' reference. They are not yet designed as a easy-to-run one-shot pipeline (but we plan to do so). Please take your time to adapt the path dependencies if you wish to replicate the computation process.
