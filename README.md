@@ -7,5 +7,16 @@ Ma, M. K.-H., Fong, M. C.-M., & Wang, W. S. (2025). A Reliability Study in Resti
 
 Ma, M. K.-H. & Fong, M. C.-M. (accepted). A Path Toward Reproducibility: A Dual Perspective on Resting-State EEG Network Characteristics.
 
-Scripts will be uploaded soon, stay tuned!!
+The codes are organized as follow:
+```
+code/
+├── S1_main_preprocessing_intermediate.py             # Step 1
+├── S2_main_filtering.py                              # Step 2
+├── S3_main_epoching_and_computing_conn_mat.py        # Step 3
+├── S4_computing_network_measures.py                  # Step 4
+└── S5_combining_conn_dataframe.py                    # Step 5
+```
 
+Step 1 to 5 detail the procedures from preprocessing to obtaining a dataframe storing the all the network characteristics computed.
+
+After step 5, the dataframe will be loaded in to R for computing reliability, we are preparing S6 and will upload soon.
