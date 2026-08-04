@@ -2,6 +2,7 @@
 """
 
 import pickle
+import warnings
 
 import bct
 import mne
@@ -111,11 +112,60 @@ def compute_network_measures(conn_mat):
         global_eff = np.nan
 
     assortativity = _safe_call(bct.assortativity_wei, conn_mat)
-    df_swp = _safe_call(swp.small_world_propensity, conn_mat)
+    with warnings.catch_warnings(record=True) as swp_warnings:
+        warnings.simplefilter("always")
+        df_swp = _safe_call(swp.small_world_propensity, conn_mat)
+
+    scalar_divide_by_zero_warnings = [
+        warning
+        for warning in swp_warnings
+        if issubclass(warning.category, RuntimeWarning)
+        and str(warning.message) == "divide by zero encountered in scalar divide"
+    ]
+    divide_by_zero_warnings = [
+        warning
+        for warning in swp_warnings
+        if issubclass(warning.category, RuntimeWarning)
+        and str(warning.message)
+        in {
+            "divide by zero encountered in divide",
+            "divide by zero encountered in scalar divide",
+        }
+    ]
+    invalid_scalar_divide_warnings = [
+        warning
+        for warning in swp_warnings
+        if issubclass(warning.category, RuntimeWarning)
+        and str(warning.message) == "invalid value encountered in scalar divide"
+    ]
+    for warning in swp_warnings:
+        if (
+            warning not in divide_by_zero_warnings
+            and warning not in invalid_scalar_divide_warnings
+        ):
+            warnings.warn_explicit(
+                warning.message,
+                warning.category,
+                warning.filename,
+                warning.lineno,
+            )
+
     if isinstance(df_swp, pd.DataFrame):
         swp_value = df_swp["SWP"].values[0]
+        auxiliary_values = [
+            df_swp[column].values[0]
+            for column in ("α", "δ")
+            if column in df_swp
+        ]
+        auxiliary_direction_undefined = (
+            bool(invalid_scalar_divide_warnings)
+            and np.isfinite(swp_value)
+            and bool(auxiliary_values)
+            and any(not np.isfinite(value) for value in auxiliary_values)
+        )
     else:
         swp_value = np.nan
+        auxiliary_direction_undefined = False
         df_swp = pd.DataFrame(
             {"SWP": [np.nan], "Clustering_Lp": [np.nan], "PathLength_Lp": [np.nan]}
         )
@@ -130,6 +180,21 @@ def compute_network_measures(conn_mat):
             "global_eff": global_eff,
             "assortativity": assortativity,
             "SWP": swp_value,
+            "SWP_divide_by_zero_warning": bool(divide_by_zero_warnings),
+            "SWP_divide_by_zero_warning_count": len(divide_by_zero_warnings),
+            "SWP_scalar_divide_by_zero_warning": bool(
+                scalar_divide_by_zero_warnings
+            ),
+            "SWP_scalar_divide_by_zero_warning_count": len(
+                scalar_divide_by_zero_warnings
+            ),
+            "SWP_invalid_scalar_divide_warning": bool(
+                invalid_scalar_divide_warnings
+            ),
+            "SWP_invalid_scalar_divide_warning_count": len(
+                invalid_scalar_divide_warnings
+            ),
+            "SWP_auxiliary_direction_undefined": auxiliary_direction_undefined,
         }
     )
     return measures.merge(df_swp, on="SWP")

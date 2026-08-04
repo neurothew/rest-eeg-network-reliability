@@ -54,7 +54,16 @@ from logging_utils import (
     use_console_log_level,
     verbose,
 )
-from compute_feat_utils import get_conn_mat, compute_network_measures, thresholding_conn_mat
+import compute_network_feat_utils
+
+# S3 pickles created before the utility rename reference this module name.
+sys.modules.setdefault("compute_feat_utils", compute_network_feat_utils)
+
+from compute_network_feat_utils import (
+    compute_network_measures,
+    get_conn_mat,
+    thresholding_conn_mat,
+)
 from joblib import Parallel, delayed
 from tqdm import tqdm
 from reliability_constants import (
